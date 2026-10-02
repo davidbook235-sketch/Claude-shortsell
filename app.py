@@ -17,9 +17,9 @@ def universe():
     try:
         r = requests.get(URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
         r.raise_for_status()
-        return pd.read_csv(io.StringIO(r.text))["Symbol"].dropna().tolist()
+        return pd.read_csv(io.StringIO(r.text))[["Symbol", "Industry"]].dropna(subset=["Symbol"])
     except Exception:
-        return FALLBACK
+        return pd.DataFrame({"Symbol": FALLBACK, "Industry": "Unknown"})
 
 
 @st.cache_data(ttl=86400)
@@ -79,6 +79,13 @@ def fetch(syms, period, interval):
     return out
 
 
+def day_chg(d):
+    """Aaj ka % change vs pichhle session ka close."""
+    dates = pd.Series(d.index.date, index=d.index)
+    prev = d.Close[dates < dates.iloc[-1]]
+    return d.Close.iloc[-1] / prev.iloc[-1] - 1 if len(prev) else np.nan
+
+
 def ind(d):
     c, h, l, v = d.Close, d.High, d.Low, d.Volume
     d["e20"] = c.ewm(span=20, adjust=False).mean()
@@ -132,7 +139,9 @@ def backtest(d, thr, k, rr, hold, cost):
 
 st.title("📉 Nifty 500 Short Scanner")
 tab1, tab2 = st.tabs(["🔍 Live Scanner", "🧪 Backtest"])
-syms_all = universe()
+udf = universe()
+syms_all = udf["Symbol"].tolist()
+sec_map = dict(zip(udf["Symbol"], udf["Industry"]))
 
 with tab1:
     c1, c2 = st.columns(2)
@@ -148,6 +157,8 @@ with tab1:
     p, iv = {"Daily": ("1y", "1d"), "1 Hour": ("3mo", "1h"), "15 Min": ("1mo", "15m")}[tf]
     fo_only = st.checkbox("Sirf F&O stocks (overnight short possible)", value=True)
     rs_only = st.checkbox("Sirf Nifty se weak stocks (RS < 0, last 20 candles)", value=True)
+    weak_n = st.slider("Kitne weakest sectors highlight karne hain", 1, 10, 4)
+    sec_only = st.checkbox("Sirf weak sectors ke stocks dikhao", value=False)
     tg = st.checkbox("Telegram alert bhejo")
     tok = chat = ""
     if tg:
@@ -166,27 +177,53 @@ with tab1:
             nr = nf.iloc[-1] / nf.iloc[-21] - 1
         except Exception:
             nr = None
-        rows = []
+        rows, sec = [], []
         for s, d in data.items():
             d = ind(d.copy())
             x = d.iloc[-1]
+            sector = sec_map.get(s, "Unknown")
+            sec.append((sector, day_chg(d)))
             rs = (x.Close / d.Close.iloc[-21] - 1 - nr) * 100 if nr is not None else np.nan
             if x.sc >= thr and x.Close >= minp and not (rs_only and rs >= 0):
                 risk = atrk * x.atr
                 qty = int((cap * rk / 100) / risk) if risk > 0 else 0
-                rows.append({"Stock": s, "LTP": round(x.Close, 2), "Score": int(x.sc),
-                             "RS%": round(rs, 2), "RSI": round(x.rsi, 1), "ADX": round(x.adx, 1), "VolX": round(x.vr, 2),
-                             "SL": round(x.Close + risk, 2), "T1 (1:2)": round(x.Close - 2 * risk, 2),
+                rows.append({"Stock": s, "Sector": sector, "LTP": round(x.Close, 2), "Score": int(x.sc),
+                             "RS%": round(rs, 2), "RSI": round(x.rsi, 1), "ADX": round(x.adx, 1),
+                             "VolX": round(x.vr, 2), "SL": round(x.Close + risk, 2),
+                             "T1 (1:2)": round(x.Close - 2 * risk, 2),
                              "T2 (1:3)": round(x.Close - 3 * risk, 2), "Qty": qty})
+        sd = pd.DataFrame(sec, columns=["Sector", "chg"]).dropna()
+        sg = sd.groupby("Sector").agg(Stocks=("chg", "size"), AvgChg=("chg", lambda v: v.mean() * 100),
+                                      Red=("chg", lambda v: (v < 0).mean() * 100))
+        sg = sg[sg.Stocks >= 3]
+        sg["r"] = sg.AvgChg.rank() + sg.Red.rank(ascending=False)
+        sg = sg.sort_values("r")
+        weak = [i for i in sg.index[:weak_n] if sg.AvgChg[i] < 0]
+        st.subheader("🏭 Sector Weakness (aaj)")
+        st.dataframe(sg.drop(columns="r").round(2).rename(columns={"AvgChg": "Avg chg %", "Red": "Red stocks %"}),
+                     use_container_width=True)
+        if weak:
+            st.info("🔻 Selling sabse zyada: " + ", ".join(
+                f"**{w}** ({sg.AvgChg[w]:.2f}%, {sg.Red[w]:.0f}% stocks red)" for w in weak)
+                + "\n\nIn sectors ke weak stocks me short setups ko priority do.")
+        else:
+            st.info("Koi sector clearly weak nahi hai abhi, short selection me extra savdhani rakho.")
         st.success(f"{len(data)} stocks scan hue, {len(rows)} short setups mile")
         if rows:
-            res = pd.DataFrame(rows).sort_values("Score", ascending=False)
+            res = pd.DataFrame(rows)
+            res["Sec%"] = res.Sector.map(sg.AvgChg).round(2)
+            res["Weak Sec"] = np.where(res.Sector.isin(weak), "🔻", "")
+            res["Final"] = res.Score + 10 * res.Sector.isin(weak)
+            if sec_only:
+                res = res[res.Sector.isin(weak)]
+            res = res.sort_values(["Final", "Score"], ascending=False)
             st.dataframe(res, hide_index=True, use_container_width=True)
-            if tg:
+            if tg and len(res):
                 if tok and chat:
-                    lines = [f"{r['Stock']} | LTP {r['LTP']} | Score {r['Score']} | SL {r['SL']} | T1 {r['T1 (1:2)']} | Qty {r['Qty']}"
+                    lines = [f"{r['Stock']} ({r['Sector']}) | LTP {r['LTP']} | Final {r['Final']} | SL {r['SL']} | T1 {r['T1 (1:2)']} | Qty {r['Qty']}"
                              for _, r in res.head(10).iterrows()]
-                    ok = tg_send(tok, chat, f"📉 Short setups ({tf})\n" + "\n".join(lines))
+                    head = f"📉 Short setups ({tf})\nWeak sectors: {', '.join(weak) or 'None'}\n"
+                    ok = tg_send(tok, chat, head + "\n".join(lines))
                     st.success("Telegram alert bhej diya ✅") if ok else st.error("Telegram alert fail hua, token/chat ID check karo")
                 else:
                     st.warning("Telegram token aur chat ID daalo.")
@@ -235,3 +272,4 @@ with tab2:
             st.dataframe(T, hide_index=True, use_container_width=True)
             st.download_button("⬇️ Trades CSV", T.to_csv(index=False), "trades.csv")
     st.caption("Entry: signal candle ke next open par short. Stop/target ATR based, stop pehle check hota hai (conservative).")
+            
